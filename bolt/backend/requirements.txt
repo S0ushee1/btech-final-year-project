@@ -1,0 +1,13 @@
+Flask==2.3.3
+Flask-CORS==4.0.0
+Flask-SQLAlchemy==3.0.5
+Flask-Migrate==4.0.7
+opencv-python==4.8.1.78
+ultralytics==8.0.196
+numpy==1.24.3
+Pillow==10.0.0
+pytest==8.3.3
+PyJWT==2.9.0
+python-dotenv==1.0.1
+waitress==3.0.0
+psycopg2-binary==2.9.9

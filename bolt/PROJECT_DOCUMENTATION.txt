@@ -1,0 +1,452 @@
+# Traffic Vision - Full Project Documentation
+
+## 1. Project Overview
+
+Traffic Vision is a full-stack traffic violation reporting and review platform with:
+- Citizen-facing media submission (image/video) for suspected traffic violations.
+- AI-assisted detection and triage using YOLOv8 + rule-based violation logic.
+- Authority workflows for confirming/rejecting reports.
+- Real-time report updates via Server-Sent Events (SSE), with polling fallback.
+
+The repository contains two main apps:
+- `backend/`: Flask API + SQLAlchemy + AI inference pipeline.
+- `frontend/`: React + TypeScript + Vite UI for citizen and authority roles.
+
+## 2. High-Level Architecture
+
+### 2.1 Backend
+- Framework: Flask
+- Database layer: Flask-SQLAlchemy
+- Migrations: Flask-Migrate
+- AI model: Ultralytics YOLO (`yolov8n.pt`)
+- Media processing: OpenCV
+- Auth: JWT (HS256)
+- Realtime: SSE endpoint at `/reports/stream`
+- Production serving: Waitress
+
+### 2.2 Frontend
+- Framework: React 18 + TypeScript
+- Build tool: Vite
+- Styling: Tailwind CSS + custom CSS utilities/components
+- State/Auth/API: central `AppContext`
+- Routing: internal state-based page switching (no React Router)
+
+### 2.3 Core Domain Flow
+1. Citizen logs in and uploads media (`/upload`).
+2. Backend stores initial `PENDING` report.
+3. AI + rule engine processes media and computes:
+   - violation list
+   - confidence score
+   - detection state (`violated`, `needs_manual_review`, `non_violated`)
+4. Backend updates report workflow status:
+   - `AI_DETECTED`, `NEEDS_MANUAL_REVIEW`, or `NO_VIOLATION`
+5. Authority reviews report and sets final status:
+   - `CONFIRMED` or `REJECTED`
+6. Frontend receives updates through SSE or periodic polling.
+
+## 3. Repository Structure
+
+```text
+backend/
+  app/
+    __init__.py            # App factory + config + DB init
+    routes.py              # REST API + auth + SSE + rate limits
+    models.py              # User, ViolationReport, LoginAudit
+    utils.py               # File validation + media processing pipeline
+    detector.py            # YOLO inference wrappers
+    violation_rules.py     # Rule-based violation logic
+    statuses.py            # Canonical report statuses + normalization
+  tests/
+    conftest.py
+    test_api_publish_ready.py
+    test_detection_state.py
+    test_regression_samples.py
+  run.py
+  requirements.txt
+  .env.example
+  yolov8n.pt
+  uploads/
+  instance/
+  logs/
+
+frontend/
+  src/
+    App.tsx                # Main app shell + page switching
+    main.tsx               # React entry point
+    context/
+      AppContext.tsx       # Auth/session/reports/realtime core
+      ThemeContext.tsx
+    pages/
+      Home.tsx
+      HowItWorks.tsx
+      AuthPage.tsx
+      ReportViolation.tsx
+      MyReports.tsx
+      ReportDetail.tsx
+      AuthorityDashboard.tsx
+      AllReports.tsx
+      Analytics.tsx
+      Profile.tsx
+    components/
+      Navigation.tsx
+      NotificationCenter.tsx
+      LiveActivityRail.tsx
+      RealtimeBadge.tsx
+      ...
+  package.json
+  vite.config.ts
+  tailwind.config.js
+```
+
+## 4. Backend Documentation
+
+### 4.1 Runtime Configuration
+
+Defined in `backend/app/__init__.py` and `.env`:
+
+- `DATABASE_URL` (default: SQLite at `backend/instance/traffic.db`)
+- `SECRET_KEY`
+- `JWT_EXPIRATION_HOURS` (default: `24`)
+- `CORS_ORIGINS` (default: `*`)
+- `FLASK_ENV` (default: `development`)
+- `HOST` (default: `127.0.0.1`)
+- `PORT` (default: `5000`)
+- `MAX_CONTENT_LENGTH` (100 MB)
+- `VIDEO_MIN_VIOLATION_FRAMES` (default `3`)
+- `DEFAULT_VIOLATION_CONFIDENCE_THRESHOLD` (default `0.88`)
+- `STRICT_RULE_THRESHOLDS`:
+  - `No Helmet`: `0.93`
+  - `Using Mobile Phone While Riding`: `0.95`
+- `RATE_LIMIT_UPLOAD_PER_MIN` (default `30`)
+- `RATE_LIMIT_REVIEW_PER_MIN` (default `60`)
+
+Development-only behavior:
+- Auto-creates tables (`db.create_all()`)
+- Applies lightweight runtime schema patching for older SQLite DBs
+
+### 4.2 Data Models
+
+#### `User`
+- `id`, `name`, `email`, `password_hash`, `role`, `created_by_user_id`, `created_at`
+- Roles used: `citizen`, `authority`
+
+#### `ViolationReport`
+- `id`, `violation_type`, `evidence_path`, `confidence_score`, `status`
+- `location`, `user_id`, `user_name`, `comments`
+- `fine_amount`, `admin_notes`
+- `created_at`, `reviewed_at`
+
+#### `LoginAudit`
+- Tracks login attempts with:
+  - email/user id/role
+  - success flag
+  - ip/user agent
+  - reason and timestamp
+- Persisted in DB and appended to `backend/logs/login_audit.jsonl`
+
+### 4.3 Report Status Model
+
+Canonical statuses (`backend/app/statuses.py`):
+- `PENDING`
+- `AI_DETECTED`
+- `NEEDS_MANUAL_REVIEW`
+- `NO_VIOLATION`
+- `CONFIRMED`
+- `REJECTED`
+
+Legacy status strings are normalized for compatibility.
+
+### 4.4 Authentication & Authorization
+
+- JWT Bearer tokens are required for protected endpoints.
+- Decorator `@require_auth(role=...)` enforces access.
+- `/auth/stream-token` issues short-lived stream token (`purpose=reports_stream`) for SSE.
+
+Role protections:
+- Citizen-only: `/upload`
+- Authority-only: `/reports/<id>/review`, `/admin/*`
+- Shared auth: `/reports`, `/reports/<id>`, profile/password endpoints
+
+### 4.5 Rate Limiting
+
+In-memory IP-based fixed-window buckets:
+- Upload: `RATE_LIMIT_UPLOAD_PER_MIN`
+- Review: `RATE_LIMIT_REVIEW_PER_MIN`
+- Returns HTTP `429` with error code `RATE_LIMIT_EXCEEDED`
+
+### 4.6 Media Processing Pipeline
+
+Implemented mainly in `backend/app/utils.py`:
+
+1. Validate media:
+   - extension (`jpg/jpeg/png/bmp/mp4/avi/mov/mkv`)
+   - MIME starts with `image/` or `video/`
+   - non-empty and size <= configured max
+2. Persist upload with UUID filename.
+3. Create initial `ViolationReport` (`PENDING`).
+4. Extract metadata (size, fps, duration, frame dimensions for video).
+5. Run `process_media()`:
+   - image path -> `_process_image`
+   - video path -> `_process_video`
+6. Compute detection state:
+   - `non_violated` if no violation
+   - `needs_manual_review` if confidence below thresholds
+   - `violated` otherwise
+7. Save evidence snapshot (annotated image) when available.
+8. Update report status (`AI_DETECTED`, `NEEDS_MANUAL_REVIEW`, `NO_VIOLATION`).
+
+### 4.7 AI + Rule Engine
+
+#### Detection (`backend/app/detector.py`)
+- Loads YOLO model once at import (`yolov8n.pt`)
+- `detect_objects(frame)` for image inference
+- `get_tracked_objects(frame)` for video tracking
+- Normalizes detections to `[x, y, w, h, id, cls]`
+
+#### Rule evaluation (`backend/app/violation_rules.py`)
+Key categories include:
+- Wrong lane / opposite direction
+- Zebra crossing obstruction
+- Stop line violation
+- Triple riding
+- No helmet (heuristics)
+- Mobile phone usage while riding (heuristics)
+- Dangerous driving (zigzag + lane/direction behavior)
+
+Final labels are mapped to UI-facing strings (e.g., `Wrong Lane Usage`, `No Helmet`, `Reckless/Dangerous Driving`).
+
+### 4.8 API Reference
+
+Base URL: `http://127.0.0.1:5000` (default local)
+
+#### Auth
+- `POST /auth/register`
+  - body: `{ name, email, password }`
+  - returns token + user
+- `POST /auth/login`
+  - body: `{ email, password }`
+- `GET /auth/me` (auth)
+- `GET /auth/stream-token` (auth)
+- `PUT /auth/profile` (auth)
+  - body: `{ name }`
+- `PUT /auth/password` (auth)
+  - body: `{ current_password, new_password }`
+
+#### Admin/User Management
+- `POST /admin/users/authority` (authority)
+- `GET /admin/users` (authority)
+- `GET /admin/login-audits` (authority)
+
+#### Reports
+- `POST /upload` (citizen, multipart)
+  - fields: `file`, `location`, `user_id` (optional), `comments`
+- `GET /reports` (auth)
+  - query: `status`, `limit`, `offset`
+- `GET /reports/<report_id>` (auth)
+- `PUT /reports/<report_id>/review` (authority)
+  - status allowed: `CONFIRMED` or `REJECTED`
+  - optional: `fine_amount`, `admin_notes`
+- `GET /reports/stream` (SSE)
+  - auth via Bearer token or `?stream_token=`
+
+#### Utility
+- `GET /health`
+- `GET /media/<filename>`
+
+### 4.9 Error Contract
+
+Most failures return:
+```json
+{
+  "success": false,
+  "error": "human readable message",
+  "error_code": "MACHINE_READABLE_CODE"
+}
+```
+
+Examples: `AUTH_REQUIRED`, `FORBIDDEN`, `INVALID_MEDIA_FILE`, `RATE_LIMIT_EXCEEDED`, etc.
+
+## 5. Frontend Documentation
+
+### 5.1 Runtime Configuration
+- API base URL:
+  - `VITE_API_BASE_URL` (fallback: `http://127.0.0.1:5000`)
+
+### 5.2 Session & State (`AppContext`)
+
+`AppContext` centralizes:
+- Login/register/logout
+- Token + user persistence (`localStorage`)
+- Report fetch + mapping
+- Upload/report review actions
+- Profile/password updates
+- Realtime stream lifecycle
+
+Status mapping from backend:
+- `AI_DETECTED` and `PENDING` -> `Pending Review`
+- `NEEDS_MANUAL_REVIEW` -> `Needs Manual Review`
+- `NO_VIOLATION` -> `No Violation (AI)`
+- `CONFIRMED` -> `Confirmed/Fine Issued`
+- `REJECTED` -> `Rejected`
+
+### 5.3 Realtime Behavior
+
+On authenticated session:
+1. Request stream token (`/auth/stream-token`).
+2. Connect to `/reports/stream?stream_token=...` via `EventSource`.
+3. On stream events, refresh reports.
+4. On stream failures, fallback to polling every 10s.
+5. Auto-retry stream with exponential backoff up to 30s.
+
+Realtime diagnostics are shown in `RealtimeBadge`.
+
+### 5.4 Navigation Model
+
+`App.tsx` uses page-state routing:
+- Public: `home`, `how-it-works`, `login`, `register`
+- Citizen pages: `report`, `my-reports`, `report-detail`, `profile`
+- Authority pages: `dashboard`, `all-reports`, `report-detail`, `analytics`, `profile`
+
+Protected pages redirect unauthenticated users to registration page.
+
+### 5.5 Key Pages
+
+- `Home`: landing, CTA to reporting flow.
+- `AuthPage`: login/register with client validation.
+- `ReportViolation`: 2-step media + details submission with optional location geocoding and annotation box.
+- `MyReports`: citizen report list with search and status cards.
+- `ReportDetail`: report evidence, timeline, AI details, authority decision actions.
+- `AuthorityDashboard`: review queue + live activity panel.
+- `AllReports`: advanced filters, saved filter views, list/table.
+- `Analytics`: status mix, trends, top violation types, key metrics.
+- `Profile`: citizen contribution stats or authority operations metrics + profile/password updates.
+
+### 5.6 Shared UI/UX Components
+
+- `Navigation`: role-aware links + auth actions
+- `NotificationCenter`: role-specific alert feed
+- `LiveActivityRail`: report activity feed
+- `RealtimeBadge`: live/polling diagnostics + reconnect action
+- `ToastViewport`: global toast display via custom event bus
+
+## 6. Setup & Run Guide
+
+## 6.1 Backend (Windows/Powershell)
+
+```powershell
+cd backend
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env
+python run.py
+```
+
+Backend default URL: `http://127.0.0.1:5000`
+
+## 6.2 Frontend
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend default URL: Vite dev server (typically `http://127.0.0.1:5173`)
+
+If needed, set API base URL in `frontend/.env`:
+
+```env
+VITE_API_BASE_URL=http://127.0.0.1:5000
+```
+
+## 6.3 Production Notes
+
+Backend:
+- `run.py` serves with Waitress when `FLASK_ENV != development`.
+- Configure strong `SECRET_KEY`, restricted `CORS_ORIGINS`, and PostgreSQL `DATABASE_URL`.
+
+Frontend:
+- Build with `npm run build`, serve static output from `frontend/dist`.
+
+## 7. Testing
+
+### 7.1 Backend Tests
+
+```powershell
+cd backend
+pytest
+```
+
+Marker notes:
+- `slow` tests run model inference/regression samples.
+- `test_regression_samples.py` expects sample files at:
+  - `../image-video/violated/*` (outside this repo directory layout).
+- One mobile-phone regression is marked `xfail` due to heuristic limitations.
+
+### 7.2 Frontend Checks
+
+```powershell
+cd frontend
+npm run typecheck
+npm run lint
+npm run build
+```
+
+## 8. Security & Operational Considerations
+
+- JWT secret defaults exist for development only; must be overridden in real deployments.
+- `/media/<filename>` currently serves by basename and does not enforce auth in route handler.
+- In-memory rate limiting resets on restart and is not distributed.
+- `uploads/`, `instance/`, and `logs/` can grow without retention policy.
+- AI decisions use heuristics; manual authority review remains critical.
+
+## 9. Known Limitations
+
+- Rule engine relies on classic CV + heuristics; not all real-world scenes are robustly handled.
+- Mobile phone detection is heuristic and intentionally less strict.
+- Theme context currently forces light mode (`toggleTheme` is a no-op).
+- Frontend uses manual page-state routing instead of URL-based router.
+
+## 10. Quick Endpoint Examples
+
+### Login
+```bash
+curl -X POST http://127.0.0.1:5000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"secret123"}'
+```
+
+### Upload report
+```bash
+curl -X POST http://127.0.0.1:5000/upload \
+  -H "Authorization: Bearer <TOKEN>" \
+  -F "file=@sample.jpg" \
+  -F "location=Main junction" \
+  -F "comments=Observed dangerous lane change"
+```
+
+### Review report (authority)
+```bash
+curl -X PUT http://127.0.0.1:5000/reports/123/review \
+  -H "Authorization: Bearer <AUTHORITY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"CONFIRMED","admin_notes":"Clear evidence"}'
+```
+
+## 11. Primary Source Files
+
+Backend:
+- `backend/app/routes.py`
+- `backend/app/models.py`
+- `backend/app/utils.py`
+- `backend/app/detector.py`
+- `backend/app/violation_rules.py`
+- `backend/app/statuses.py`
+- `backend/app/__init__.py`
+
+Frontend:
+- `frontend/src/context/AppContext.tsx`
+- `frontend/src/App.tsx`
+- `frontend/src/pages/*.tsx`
+- `frontend/src/components/*.tsx`
